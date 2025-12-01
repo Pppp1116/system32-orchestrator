@@ -28,6 +28,7 @@ type Config struct {
 	ListFile    string
 	DBPath      string
 	Workers     int
+	MaxRetries  int
 }
 
 // extensões suportadas pelo Ghidra (para este pipeline)
@@ -52,6 +53,7 @@ func defaultConfig() *Config {
 		ListFile:    `C:\binlist.txt`,
 		DBPath:      `orchestrator_state.sqlite`,
 		Workers:     4,
+		MaxRetries:  3,
 	}
 }
 
@@ -76,7 +78,7 @@ func main() {
 		log.Fatalf("ERRO: não consegui criar OutRoot %s: %v", cfg.OutRoot, err)
 	}
 
-	db, err := initDB(cfg.DBPath)
+	db, err := initDB(cfg.DBPath, cfg.Workers)
 	if err != nil {
 		log.Fatalf("ERRO initDB: %v", err)
 	}
@@ -85,6 +87,9 @@ func main() {
 	// Corrigir bins que ficaram em 'running' de runs anteriores → 'pending'
 	if err := resetRunningToPending(db); err != nil {
 		log.Fatalf("ERRO resetRunningToPending: %v", err)
+	}
+	if err := resetRetryableErrors(db, cfg.MaxRetries); err != nil {
+		log.Fatalf("ERRO resetRetryableErrors: %v", err)
 	}
 
 	// Seed inicial / refresh: lê binlist.txt, aplica filtro de extensões, sincroniza com disco (JSON existe ou não)
@@ -138,6 +143,11 @@ func buildConfigFromArgs() *Config {
 			cfg.Workers = w
 		}
 	}
+	if len(args) >= 9 {
+		if mr, err := strconv.Atoi(args[8]); err == nil && mr > 0 {
+			cfg.MaxRetries = mr
+		}
+	}
 
 	log.Printf("Config: %#v", *cfg)
 	return cfg
@@ -145,12 +155,23 @@ func buildConfigFromArgs() *Config {
 
 // ==== DB SETUP ====
 
-func initDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", path)
+func initDB(path string, workerCount int) (*sql.DB, error) {
+	busyTimeoutMs := 5000
+	dsn := fmt.Sprintf("%s?_busy_timeout=%d&_journal_mode=WAL", path, busyTimeoutMs)
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}
 
+	// Limit and recycle connections to reduce lock contention noise when many workers compete.
+	maxConns := workerCount*2 + 2
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(workerCount)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
+		log.Printf("WARN: PRAGMA busy_timeout falhou: %v", err)
+	}
 	// Pragmas básicos para melhor concorrência
 	if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
 		log.Printf("WARN: PRAGMA journal_mode=WAL falhou: %v", err)
@@ -190,6 +211,22 @@ SET status = 'pending',
     updated_at = ?
 WHERE status = 'running';
 `, nowStr())
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// resetRetryableErrors recoloca em pending erros anteriores que ainda não atingiram o limite de tentativas.
+func resetRetryableErrors(db *sql.DB, maxRetries int) error {
+	_, err := db.Exec(`
+UPDATE bins
+SET status = 'pending',
+    last_result = 'retry_pending',
+    updated_at = ?
+WHERE status = 'error'
+  AND retries < ?;
+`, nowStr(), maxRetries)
 	if err != nil {
 		return err
 	}
@@ -292,13 +329,15 @@ ON CONFLICT(path) DO UPDATE SET
 // ==== WORKER / SCHEDULER ====
 
 type BinJob struct {
-	ID   int64
-	Path string
+	ID      int64
+	Path    string
+	Retries int
 }
 
 func workerLoop(id int, db *sql.DB, cfg *Config) {
+	ctx := context.Background()
 	for {
-		job, err := claimNextPending(db)
+		job, err := claimNextPending(ctx, db, cfg.MaxRetries)
 		if err != nil {
 			log.Printf("[worker %d] ERRO claimNextPending: %v", id, err)
 			time.Sleep(2 * time.Second)
@@ -309,12 +348,12 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 			return
 		}
 
-		log.Printf("[worker %d] START id=%d path=%s", id, job.ID, job.Path)
+		log.Printf("[worker %d] START id=%d path=%s (tentativa %d/%d)", id, job.ID, job.Path, job.Retries, cfg.MaxRetries)
 
 		projectName := fmt.Sprintf("%s_w%d", cfg.ProjectName, id)
-		ctx := context.Background() // sem timeout
+		cmdCtx := context.Background() // sem timeout; pode ser ajustado no futuro
 
-		err = runGhidraForBin(ctx, cfg, job.Path, id, projectName)
+		err = runGhidraForBin(cmdCtx, cfg, job.Path, id, projectName)
 		jsonExists := false
 
 		binName := filepath.Base(job.Path)
@@ -323,18 +362,33 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 			jsonExists = true
 		}
 
+		shouldRetry := job.Retries < cfg.MaxRetries
+		hitLimit := !shouldRetry
+
 		if err != nil {
-			log.Printf("[worker %d] ERRO Ghidra id=%d path=%s: %v", id, job.ID, job.Path, err)
-			if upErr := updateBinError(db, job.ID, jsonExists, err); upErr != nil {
+			log.Printf("[worker %d] ERRO Ghidra id=%d path=%s (tentativa %d/%d): %v", id, job.ID, job.Path, job.Retries, cfg.MaxRetries, err)
+			if upErr := updateBinError(db, job.ID, jsonExists, err, shouldRetry, hitLimit); upErr != nil {
 				log.Printf("[worker %d] ERRO updateBinError: %v", id, upErr)
+			}
+			if hitLimit {
+				log.Printf("[worker %d] Limite de tentativas atingido para id=%d path=%s", id, job.ID, job.Path)
+			}
+			if shouldRetry {
+				time.Sleep(2 * time.Second)
 			}
 			continue
 		}
 
 		if !jsonExists {
-			log.Printf("[worker %d] ERRO: sem JSON depois de Ghidra para id=%d path=%s", id, job.ID, job.Path)
-			if upErr := updateBinError(db, job.ID, false, fmt.Errorf("json_missing")); upErr != nil {
+			log.Printf("[worker %d] ERRO: sem JSON depois de Ghidra para id=%d path=%s (tentativa %d/%d)", id, job.ID, job.Path, job.Retries, cfg.MaxRetries)
+			if upErr := updateBinError(db, job.ID, false, fmt.Errorf("json_missing"), shouldRetry, hitLimit); upErr != nil {
 				log.Printf("[worker %d] ERRO updateBinError(json_missing): %v", id, upErr)
+			}
+			if hitLimit {
+				log.Printf("[worker %d] Limite de tentativas atingido para id=%d path=%s", id, job.ID, job.Path)
+			}
+			if shouldRetry {
+				time.Sleep(2 * time.Second)
 			}
 			continue
 		}
@@ -342,55 +396,101 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 		if upErr := updateBinSuccess(db, job.ID); upErr != nil {
 			log.Printf("[worker %d] ERRO updateBinSuccess: %v", id, upErr)
 		} else {
-			log.Printf("[worker %d] DONE id=%d path=%s", id, job.ID, job.Path)
+			log.Printf("[worker %d] DONE id=%d path=%s (tentativa %d/%d)", id, job.ID, job.Path, job.Retries, cfg.MaxRetries)
 		}
 	}
 }
 
-func claimNextPending(db *sql.DB) (*BinJob, error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
+func isBusyError(err error) bool {
+	if err == nil {
+		return false
 	}
-	defer func() {
-		// se não der commit explícito mais abaixo, rollback
-		_ = tx.Rollback()
-	}()
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy")
+}
 
-	row := tx.QueryRow(`
-SELECT id, path
+func claimNextPending(ctx context.Context, db *sql.DB, maxRetries int) (*BinJob, error) {
+	const maxAttempts = 8
+	backoff := 200 * time.Millisecond
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		tx, err := db.BeginTx(ctx, &sql.TxOptions{})
+		if err != nil {
+			if isBusyError(err) {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return nil, err
+		}
+
+		row := tx.QueryRow(`
+SELECT id, path, retries
 FROM bins
 WHERE status = 'pending'
+  AND retries < ?
 ORDER BY id
 LIMIT 1;
-`)
+`, maxRetries)
 
-	var id int64
-	var path string
-	err = row.Scan(&id, &path)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
+		var id int64
+		var path string
+		var retries int
+		err = row.Scan(&id, &path, &retries)
+		if err == sql.ErrNoRows {
+			_ = tx.Rollback()
+			return nil, nil
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			if isBusyError(err) {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return nil, err
+		}
 
-	_, err = tx.Exec(`
+		res, err := tx.Exec(`
 UPDATE bins
 SET status = 'running',
     retries = retries + 1,
     updated_at = ?
-WHERE id = ?;
-`, nowStr(), id)
-	if err != nil {
-		return nil, err
+WHERE id = ?
+  AND status = 'pending'
+  AND retries = ?;
+`, nowStr(), id, retries)
+		if err != nil {
+			_ = tx.Rollback()
+			if isBusyError(err) {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return nil, err
+		}
+
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			_ = tx.Rollback()
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+
+		if err := tx.Commit(); err != nil {
+			if isBusyError(err) {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return nil, err
+		}
+
+		return &BinJob{ID: id, Path: path, Retries: retries + 1}, nil
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
-	return &BinJob{ID: id, Path: path}, nil
+	return nil, fmt.Errorf("não consegui claim pendente depois de %d tentativas", maxAttempts)
 }
 
 func updateBinSuccess(db *sql.DB, id int64) error {
@@ -406,7 +506,7 @@ WHERE id = ?;
 	return err
 }
 
-func updateBinError(db *sql.DB, id int64, hasJSON bool, cause error) error {
+func updateBinError(db *sql.DB, id int64, hasJSON bool, cause error, retryPending bool, hitLimit bool) error {
 	h := 0
 	if hasJSON {
 		h = 1
@@ -415,15 +515,24 @@ func updateBinError(db *sql.DB, id int64, hasJSON bool, cause error) error {
 	if cause != nil {
 		msg = cause.Error()
 	}
+	status := "error"
+	result := "ghidra_error"
+	if retryPending {
+		status = "pending"
+		result = "retry_pending"
+	} else if hitLimit {
+		result = "retry_limit"
+	}
+
 	_, err := db.Exec(`
 UPDATE bins
-SET status = 'error',
+SET status = ?,
     has_json = ?,
-    last_result = 'ghidra_error',
+    last_result = ?,
     last_error = ?,
     updated_at = ?
 WHERE id = ?;
-`, h, msg, nowStr(), id)
+`, status, h, result, msg, nowStr(), id)
 	return err
 }
 
@@ -441,7 +550,7 @@ func runGhidraForBin(ctx context.Context, cfg *Config, binPath string, workerID 
 		cfg.OutRoot,
 	}
 
-	log.Printf("[worker %d] CMD %s %s", workerID, cfg.GhidraExe, strings.Join(args, " "))
+	log.Printf("[worker %d] CMD %q args=%q", workerID, cfg.GhidraExe, args)
 
 	cmd := exec.CommandContext(ctx, cfg.GhidraExe, args...)
 	out, err := cmd.CombinedOutput()
@@ -451,6 +560,9 @@ func runGhidraForBin(ctx context.Context, cfg *Config, binPath string, workerID 
 	}
 
 	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("Ghidra exit code %d: %w", exitErr.ExitCode(), err)
+		}
 		return fmt.Errorf("Ghidra exit error: %w", err)
 	}
 
