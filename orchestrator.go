@@ -19,16 +19,18 @@ import (
 )
 
 type Config struct {
-	GhidraExe   string
-	ProjectRoot string
-	ProjectName string
-	ScriptPath  string
-	PostScript  string
-	OutRoot     string
-	ListFile    string
-	DBPath      string
-	Workers     int
-	MaxRetries  int
+	GhidraExe     string
+	ProjectRoot   string
+	ProjectName   string
+	ScriptPath    string
+	PostScript    string
+	OutRoot       string
+	ListFile      string
+	DBPath        string
+	Workers       int
+	MaxRetries    int
+	ValidatePaths bool
+	GhidraRetries int
 }
 
 // extensões suportadas pelo Ghidra (para este pipeline)
@@ -44,16 +46,18 @@ var allowedExt = map[string]bool{
 
 func defaultConfig() *Config {
 	return &Config{
-		GhidraExe:   `C:\work\ghidrainstall\ghidra_11.4.2_PUBLIC\support\analyzeHeadless.bat`,
-		ProjectRoot: `C:\GhidraProjectsUser`,
-		ProjectName: `Sys32Proj`,
-		ScriptPath:  `C:\ghidra\scripts`,
-		PostScript:  `export_full_json.py`,
-		OutRoot:     `C:\ghidra_exports`,
-		ListFile:    `C:\binlist.txt`,
-		DBPath:      `orchestrator_state.sqlite`,
-		Workers:     4,
-		MaxRetries:  3,
+		GhidraExe:     `C:\work\ghidrainstall\ghidra_11.4.2_PUBLIC\support\analyzeHeadless.bat`,
+		ProjectRoot:   `C:\GhidraProjectsUser`,
+		ProjectName:   `Sys32Proj`,
+		ScriptPath:    `C:\ghidra\scripts`,
+		PostScript:    `export_full_json.py`,
+		OutRoot:       `C:\ghidra_exports`,
+		ListFile:      `C:\binlist.txt`,
+		DBPath:        `orchestrator_state.sqlite`,
+		Workers:       4,
+		MaxRetries:    3,
+		ValidatePaths: false,
+		GhidraRetries: 0,
 	}
 }
 
@@ -70,6 +74,10 @@ func main() {
 	}
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("========== Orchestrator v2 start ==========")
+
+	if cfg.ValidatePaths {
+		validateListPaths(cfg)
+	}
 
 	if err := os.MkdirAll(cfg.ProjectRoot, 0755); err != nil {
 		log.Fatalf("ERRO: não consegui criar ProjectRoot %s: %v", cfg.ProjectRoot, err)
@@ -117,6 +125,15 @@ func buildConfigFromArgs() *Config {
 	cfg := defaultConfig()
 	args := os.Args[1:]
 
+	if envVal := os.Getenv("VALIDATE_BIN_PATHS"); envVal != "" {
+		cfg.ValidatePaths = parseEnvBool(envVal)
+	}
+	if envVal := os.Getenv("GHIDRA_RETRIES"); envVal != "" {
+		if retries, err := strconv.Atoi(envVal); err == nil && retries >= 0 {
+			cfg.GhidraRetries = retries
+		}
+	}
+
 	if len(args) >= 1 {
 		cfg.GhidraExe = args[0]
 	}
@@ -151,6 +168,15 @@ func buildConfigFromArgs() *Config {
 
 	log.Printf("Config: %#v", *cfg)
 	return cfg
+}
+
+func parseEnvBool(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // ==== DB SETUP ====
@@ -231,6 +257,41 @@ WHERE status = 'error'
 		return err
 	}
 	return nil
+}
+
+func validateListPaths(cfg *Config) {
+	f, err := os.Open(cfg.ListFile)
+	if err != nil {
+		log.Printf("WARN: validateListPaths open %s: %v", cfg.ListFile, err)
+		return
+	}
+	defer f.Close()
+
+	r := bufio.NewReader(f)
+	for {
+		line, err := r.ReadString('\n')
+		if len(line) > 0 {
+			parts := strings.SplitN(line, "#", 2)
+			path := filepath.Clean(strings.TrimSpace(parts[0]))
+			if path != "" {
+				if _, statErr := os.Stat(path); statErr != nil {
+					if os.IsNotExist(statErr) {
+						log.Printf("WARN: bin path missing (validate only): %s", path)
+					} else {
+						log.Printf("WARN: bin path stat failed (validate only) %s: %v", path, statErr)
+					}
+				}
+			}
+		}
+
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Printf("WARN: validateListPaths read error: %v", err)
+			return
+		}
+	}
 }
 
 // ==== SEED A PARTIR DO BINLIST, COM FILTRO DE EXTENSÕES E REFRESH ====
@@ -348,12 +409,14 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 			return
 		}
 
-		log.Printf("[worker %d] START id=%d path=%s (tentativa %d/%d)", id, job.ID, job.Path, job.Retries, cfg.MaxRetries)
+		jobStart := time.Now()
+		startStamp := jobStart.UTC().Format(time.RFC3339Nano)
+		log.Printf("[worker %d] JOB START ts=%s id=%d path=%s attempt=%d/%d", id, startStamp, job.ID, job.Path, job.Retries, cfg.MaxRetries)
 
 		projectName := fmt.Sprintf("%s_w%d", cfg.ProjectName, id)
 		cmdCtx := context.Background() // sem timeout; pode ser ajustado no futuro
 
-		err = runGhidraForBin(cmdCtx, cfg, job.Path, id, projectName)
+		exitCode, err := runGhidraForBin(cmdCtx, cfg, job.Path, id, projectName)
 		jsonExists := false
 
 		binName := filepath.Base(job.Path)
@@ -364,9 +427,10 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 
 		shouldRetry := job.Retries < cfg.MaxRetries
 		hitLimit := !shouldRetry
+		elapsed := time.Since(jobStart)
 
 		if err != nil {
-			log.Printf("[worker %d] ERRO Ghidra id=%d path=%s (tentativa %d/%d): %v", id, job.ID, job.Path, job.Retries, cfg.MaxRetries, err)
+			log.Printf("[worker %d] JOB END ts=%s id=%d path=%s attempt=%d/%d exit=%d elapsed=%s status=error err=%v", id, time.Now().UTC().Format(time.RFC3339Nano), job.ID, job.Path, job.Retries, cfg.MaxRetries, exitCode, elapsed, err)
 			if upErr := updateBinError(db, job.ID, jsonExists, err, shouldRetry, hitLimit); upErr != nil {
 				log.Printf("[worker %d] ERRO updateBinError: %v", id, upErr)
 			}
@@ -380,7 +444,7 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 		}
 
 		if !jsonExists {
-			log.Printf("[worker %d] ERRO: sem JSON depois de Ghidra para id=%d path=%s (tentativa %d/%d)", id, job.ID, job.Path, job.Retries, cfg.MaxRetries)
+			log.Printf("[worker %d] JOB END ts=%s id=%d path=%s attempt=%d/%d exit=%d elapsed=%s status=error err=json_missing", id, time.Now().UTC().Format(time.RFC3339Nano), job.ID, job.Path, job.Retries, cfg.MaxRetries, exitCode, elapsed)
 			if upErr := updateBinError(db, job.ID, false, fmt.Errorf("json_missing"), shouldRetry, hitLimit); upErr != nil {
 				log.Printf("[worker %d] ERRO updateBinError(json_missing): %v", id, upErr)
 			}
@@ -396,11 +460,10 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 		if upErr := updateBinSuccess(db, job.ID); upErr != nil {
 			log.Printf("[worker %d] ERRO updateBinSuccess: %v", id, upErr)
 		} else {
-			log.Printf("[worker %d] DONE id=%d path=%s (tentativa %d/%d)", id, job.ID, job.Path, job.Retries, cfg.MaxRetries)
+			log.Printf("[worker %d] JOB END ts=%s id=%d path=%s attempt=%d/%d exit=%d elapsed=%s status=done", id, time.Now().UTC().Format(time.RFC3339Nano), job.ID, job.Path, job.Retries, cfg.MaxRetries, exitCode, elapsed)
 		}
 	}
 }
-
 func isBusyError(err error) bool {
 	if err == nil {
 		return false
@@ -538,7 +601,7 @@ WHERE id = ?;
 
 // ==== GHIDRA CALL ====
 
-func runGhidraForBin(ctx context.Context, cfg *Config, binPath string, workerID int, projectName string) error {
+func runGhidraForBin(ctx context.Context, cfg *Config, binPath string, workerID int, projectName string) (int, error) {
 	binName := filepath.Base(binPath)
 	args := []string{
 		cfg.ProjectRoot,
@@ -552,19 +615,67 @@ func runGhidraForBin(ctx context.Context, cfg *Config, binPath string, workerID 
 
 	log.Printf("[worker %d] CMD %q args=%q", workerID, cfg.GhidraExe, args)
 
+	maxAttempts := cfg.GhidraRetries + 1
+	var lastExit int
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptStart := time.Now()
+		attemptTs := attemptStart.UTC().Format(time.RFC3339Nano)
+		log.Printf("[worker %d] GHIDRA START ts=%s bin=%s attempt=%d/%d", workerID, attemptTs, binName, attempt, maxAttempts)
+
+		exitCode, err := runSingleGhidra(ctx, cfg, workerID, binName, args)
+
+		elapsed := time.Since(attemptStart)
+		endTs := time.Now().UTC().Format(time.RFC3339Nano)
+
+		if err == nil {
+			log.Printf("[worker %d] GHIDRA END ts=%s bin=%s attempt=%d/%d exit=%d elapsed=%s", workerID, endTs, binName, attempt, maxAttempts, exitCode, elapsed)
+			return exitCode, nil
+		}
+
+		log.Printf("[worker %d] GHIDRA END ts=%s bin=%s attempt=%d/%d exit=%d elapsed=%s err=%v", workerID, endTs, binName, attempt, maxAttempts, exitCode, elapsed, err)
+
+		lastExit = exitCode
+		lastErr = err
+
+		if exitCode <= 0 || attempt == maxAttempts {
+			return exitCode, err
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return lastExit, lastErr
+}
+
+func runSingleGhidra(ctx context.Context, cfg *Config, workerID int, binName string, args []string) (int, error) {
 	cmd := exec.CommandContext(ctx, cfg.GhidraExe, args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("pipe stdout: %w", err)
+		return -1, fmt.Errorf("pipe stdout: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("pipe stderr: %w", err)
+		if stdout != nil {
+			_ = stdout.Close()
+		}
+		return -1, fmt.Errorf("pipe stderr: %w", err)
+	}
+
+	cleanup := func() {
+		if stdout != nil {
+			_ = stdout.Close()
+		}
+		if stderr != nil {
+			_ = stderr.Close()
+		}
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start ghidra: %w", err)
+		cleanup()
+		return -1, fmt.Errorf("start ghidra: %w", err)
 	}
 
 	var wg sync.WaitGroup
@@ -578,14 +689,17 @@ func runGhidraForBin(ctx context.Context, cfg *Config, binPath string, workerID 
 
 	wg.Wait()
 
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return fmt.Errorf("Ghidra exit code %d: %w", exitErr.ExitCode(), err)
+	waitErr := cmd.Wait()
+	cleanup()
+
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			return exitErr.ExitCode(), fmt.Errorf("Ghidra exit code %d: %w", exitErr.ExitCode(), waitErr)
 		}
-		return fmt.Errorf("Ghidra exit error: %w", err)
+		return -1, fmt.Errorf("Ghidra exit error: %w", waitErr)
 	}
 
-	return nil
+	return 0, nil
 }
 
 // streamCmdOutput lê de r sem limite de tamanho de linha e envia cada linha para sink.
