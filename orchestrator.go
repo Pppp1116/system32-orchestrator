@@ -92,16 +92,22 @@ func main() {
 	}
 	defer db.Close()
 
+	store, err := prepareBinStore(db)
+	if err != nil {
+		log.Fatalf("ERRO prepareBinStore: %v", err)
+	}
+	defer store.Close()
+
 	// Corrigir bins que ficaram em 'running' de runs anteriores → 'pending'
-	if err := resetRunningToPending(db); err != nil {
+	if err := resetRunningToPending(store); err != nil {
 		log.Fatalf("ERRO resetRunningToPending: %v", err)
 	}
-	if err := resetRetryableErrors(db, cfg.MaxRetries); err != nil {
+	if err := resetRetryableErrors(store, cfg.MaxRetries); err != nil {
 		log.Fatalf("ERRO resetRetryableErrors: %v", err)
 	}
 
 	// Seed inicial / refresh: lê binlist.txt, aplica filtro de extensões, sincroniza com disco (JSON existe ou não)
-	if err := seedFromList(db, cfg); err != nil {
+	if err := seedFromList(store, cfg); err != nil {
 		log.Fatalf("ERRO seedFromList: %v", err)
 	}
 
@@ -111,7 +117,7 @@ func main() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			workerLoop(id, db, cfg)
+			workerLoop(id, store, cfg)
 		}(i)
 	}
 
@@ -183,7 +189,7 @@ func parseEnvBool(val string) bool {
 
 func initDB(path string, workerCount int) (*sql.DB, error) {
 	busyTimeoutMs := 5000
-	dsn := fmt.Sprintf("%s?_busy_timeout=%d&_journal_mode=WAL", path, busyTimeoutMs)
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)", path, busyTimeoutMs)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
@@ -194,17 +200,6 @@ func initDB(path string, workerCount int) (*sql.DB, error) {
 	db.SetMaxOpenConns(maxConns)
 	db.SetMaxIdleConns(workerCount)
 	db.SetConnMaxLifetime(30 * time.Minute)
-
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
-		log.Printf("WARN: PRAGMA busy_timeout falhou: %v", err)
-	}
-	// Pragmas básicos para melhor concorrência
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
-		log.Printf("WARN: PRAGMA journal_mode=WAL falhou: %v", err)
-	}
-	if _, err := db.Exec(`PRAGMA synchronous = NORMAL;`); err != nil {
-		log.Printf("WARN: PRAGMA synchronous=NORMAL falhou: %v", err)
-	}
 
 	schema := `
 CREATE TABLE IF NOT EXISTS bins (
@@ -225,18 +220,141 @@ CREATE TABLE IF NOT EXISTS bins (
 	return db, nil
 }
 
-func nowStr() string {
-	return time.Now().UTC().Format(time.RFC3339)
+type BinStore struct {
+	db *sql.DB
+
+	stmtResetRunning      *sql.Stmt
+	stmtResetRetryable    *sql.Stmt
+	stmtUpsertUnsupported *sql.Stmt
+	stmtUpsertBin         *sql.Stmt
+	stmtSelectPending     *sql.Stmt
+	stmtClaimPending      *sql.Stmt
+	stmtUpdateSuccess     *sql.Stmt
+	stmtUpdateError       *sql.Stmt
 }
 
-func resetRunningToPending(db *sql.DB) error {
-	_, err := execWithRetry(db, `
+func prepareBinStore(db *sql.DB) (*BinStore, error) {
+	resetRunning := `
 UPDATE bins
 SET status = 'pending',
     last_result = 'interrupted',
     updated_at = ?
-WHERE status = 'running';
-`, nowStr())
+WHERE status = 'running';`
+
+	resetRetryable := `
+UPDATE bins
+SET status = 'pending',
+    last_result = 'retry_pending',
+    updated_at = ?
+WHERE status = 'error'
+  AND retries < ?;`
+
+	upsertUnsupported := `
+INSERT INTO bins (path, status, has_json, last_result, last_error, retries, updated_at)
+VALUES (?, 'skipped', 0, 'unsupported_ext', NULL, 0, ?)
+ON CONFLICT(path) DO UPDATE SET
+  status      = 'skipped',
+  has_json    = 0,
+  last_result = 'unsupported_ext',
+  last_error  = NULL,
+  updated_at  = excluded.updated_at;`
+
+	upsertBin := `
+INSERT INTO bins (path, status, has_json, last_result, last_error, retries, updated_at)
+VALUES (?, ?, ?, ?, NULL, 0, ?)
+ON CONFLICT(path) DO UPDATE SET
+  status      = excluded.status,
+  has_json    = excluded.has_json,
+  last_result = excluded.last_result,
+  updated_at  = excluded.updated_at;`
+
+	selectPending := `
+SELECT id, path, retries
+FROM bins
+WHERE status = 'pending'
+  AND retries < ?
+ORDER BY id
+LIMIT 1;`
+
+	claimPending := `
+UPDATE bins
+SET status = 'running',
+    retries = retries + 1,
+    updated_at = ?
+WHERE id = ?
+  AND status = 'pending'
+  AND retries = ?;`
+
+	updateSuccess := `
+UPDATE bins
+SET status = 'done',
+    has_json = 1,
+    last_result = 'ok',
+    last_error = NULL,
+    updated_at = ?
+WHERE id = ?;`
+
+	updateError := `
+UPDATE bins
+SET status = ?,
+    has_json = ?,
+    last_result = ?,
+    last_error = ?,
+    updated_at = ?
+WHERE id = ?;`
+
+	// Prepare all statements once so workers and helpers reuse the compiled plans.
+	store := &BinStore{db: db}
+	stmts := []struct {
+		ptr   **sql.Stmt
+		query string
+	}{
+		{&store.stmtResetRunning, resetRunning},
+		{&store.stmtResetRetryable, resetRetryable},
+		{&store.stmtUpsertUnsupported, upsertUnsupported},
+		{&store.stmtUpsertBin, upsertBin},
+		{&store.stmtSelectPending, selectPending},
+		{&store.stmtClaimPending, claimPending},
+		{&store.stmtUpdateSuccess, updateSuccess},
+		{&store.stmtUpdateError, updateError},
+	}
+
+	for _, def := range stmts {
+		stmt, err := db.Prepare(def.query)
+		if err != nil {
+			store.Close()
+			return nil, err
+		}
+		*def.ptr = stmt
+	}
+
+	return store, nil
+}
+
+func (s *BinStore) Close() {
+	stmts := []*sql.Stmt{
+		s.stmtResetRunning,
+		s.stmtResetRetryable,
+		s.stmtUpsertUnsupported,
+		s.stmtUpsertBin,
+		s.stmtSelectPending,
+		s.stmtClaimPending,
+		s.stmtUpdateSuccess,
+		s.stmtUpdateError,
+	}
+	for _, stmt := range stmts {
+		if stmt != nil {
+			_ = stmt.Close()
+		}
+	}
+}
+
+func nowStr() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func resetRunningToPending(store *BinStore) error {
+	_, err := execStmtWithRetry(store.stmtResetRunning, nowStr())
 	if err != nil {
 		return err
 	}
@@ -244,15 +362,8 @@ WHERE status = 'running';
 }
 
 // resetRetryableErrors recoloca em pending erros anteriores que ainda não atingiram o limite de tentativas.
-func resetRetryableErrors(db *sql.DB, maxRetries int) error {
-	_, err := execWithRetry(db, `
-UPDATE bins
-SET status = 'pending',
-    last_result = 'retry_pending',
-    updated_at = ?
-WHERE status = 'error'
-  AND retries < ?;
-`, nowStr(), maxRetries)
+func resetRetryableErrors(store *BinStore, maxRetries int) error {
+	_, err := execStmtWithRetry(store.stmtResetRetryable, nowStr(), maxRetries)
 	if err != nil {
 		return err
 	}
@@ -296,7 +407,7 @@ func validateListPaths(cfg *Config) {
 
 // ==== SEED A PARTIR DO BINLIST, COM FILTRO DE EXTENSÕES E REFRESH ====
 
-func seedFromList(db *sql.DB, cfg *Config) error {
+func seedFromList(store *BinStore, cfg *Config) error {
 	f, err := os.Open(cfg.ListFile)
 	if err != nil {
 		return err
@@ -315,7 +426,7 @@ func seedFromList(db *sql.DB, cfg *Config) error {
 				parts := strings.SplitN(line, "#", 2)
 				path := filepath.Clean(strings.TrimSpace(parts[0]))
 				if path != "" {
-					if upErr := upsertBinFromPath(db, cfg, path); upErr != nil {
+					if upErr := upsertBinFromPath(store, cfg, path); upErr != nil {
 						log.Printf("WARN: upsertBinFromPath(%s): %v", path, upErr)
 					} else {
 						count++
@@ -337,22 +448,13 @@ func seedFromList(db *sql.DB, cfg *Config) error {
 	return nil
 }
 
-func upsertBinFromPath(db *sql.DB, cfg *Config, path string) error {
+func upsertBinFromPath(store *BinStore, cfg *Config, path string) error {
 	ext := strings.ToLower(filepath.Ext(path))
 	now := nowStr()
 
 	// se extensão não é suportada → SKIPPED
 	if !allowedExt[ext] {
-		_, err := execWithRetry(db, `
-INSERT INTO bins (path, status, has_json, last_result, last_error, retries, updated_at)
-VALUES (?, 'skipped', 0, 'unsupported_ext', NULL, 0, ?)
-ON CONFLICT(path) DO UPDATE SET
-  status      = 'skipped',
-  has_json    = 0,
-  last_result = 'unsupported_ext',
-  last_error  = NULL,
-  updated_at  = excluded.updated_at;
-`, path, now)
+		_, err := execStmtWithRetry(store.stmtUpsertUnsupported, path, now)
 		return err
 	}
 
@@ -374,15 +476,7 @@ ON CONFLICT(path) DO UPDATE SET
 	// Se já existe row, isto força o estado a bater certo com o disco:
 	// - se JSON existe → done
 	// - se JSON não existe → pending
-	_, err := execWithRetry(db, `
-INSERT INTO bins (path, status, has_json, last_result, last_error, retries, updated_at)
-VALUES (?, ?, ?, ?, NULL, 0, ?)
-ON CONFLICT(path) DO UPDATE SET
-  status      = excluded.status,
-  has_json    = excluded.has_json,
-  last_result = excluded.last_result,
-  updated_at  = excluded.updated_at;
-`, path, status, hasJSON, lastResult, now)
+	_, err := execStmtWithRetry(store.stmtUpsertBin, path, status, hasJSON, lastResult, now)
 
 	return err
 }
@@ -395,16 +489,16 @@ type BinJob struct {
 	Retries int
 }
 
-func workerLoop(id int, db *sql.DB, cfg *Config) {
+func workerLoop(id int, store *BinStore, cfg *Config) {
 	ctx := context.Background()
 	for {
-		job, err := claimNextPending(ctx, db, cfg.MaxRetries)
+		job, ok, err := claimPendingBin(ctx, store, cfg.MaxRetries)
 		if err != nil {
-			log.Printf("[worker %d] ERRO claimNextPending: %v", id, err)
+			log.Printf("[worker %d] ERRO claimPendingBin: %v", id, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		if job == nil {
+		if !ok {
 			log.Printf("[worker %d] Sem mais bins pendentes, a terminar.", id)
 			return
 		}
@@ -431,7 +525,7 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 
 		if err != nil {
 			log.Printf("[worker %d] JOB END ts=%s id=%d path=%s attempt=%d/%d exit=%d elapsed=%s status=error err=%v", id, time.Now().UTC().Format(time.RFC3339Nano), job.ID, job.Path, job.Retries, cfg.MaxRetries, exitCode, elapsed, err)
-			if upErr := updateBinError(db, job.ID, jsonExists, err, shouldRetry, hitLimit); upErr != nil {
+			if upErr := updateBinError(ctx, store, job.ID, jsonExists, err, shouldRetry, hitLimit); upErr != nil {
 				log.Printf("[worker %d] ERRO updateBinError: %v", id, upErr)
 			}
 			if hitLimit {
@@ -445,7 +539,7 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 
 		if !jsonExists {
 			log.Printf("[worker %d] JOB END ts=%s id=%d path=%s attempt=%d/%d exit=%d elapsed=%s status=error err=json_missing", id, time.Now().UTC().Format(time.RFC3339Nano), job.ID, job.Path, job.Retries, cfg.MaxRetries, exitCode, elapsed)
-			if upErr := updateBinError(db, job.ID, false, fmt.Errorf("json_missing"), shouldRetry, hitLimit); upErr != nil {
+			if upErr := updateBinError(ctx, store, job.ID, false, fmt.Errorf("json_missing"), shouldRetry, hitLimit); upErr != nil {
 				log.Printf("[worker %d] ERRO updateBinError(json_missing): %v", id, upErr)
 			}
 			if hitLimit {
@@ -457,7 +551,7 @@ func workerLoop(id int, db *sql.DB, cfg *Config) {
 			continue
 		}
 
-		if upErr := updateBinSuccess(db, job.ID); upErr != nil {
+		if upErr := updateBinSuccess(ctx, store, job.ID); upErr != nil {
 			log.Printf("[worker %d] ERRO updateBinSuccess: %v", id, upErr)
 		} else {
 			log.Printf("[worker %d] JOB END ts=%s id=%d path=%s attempt=%d/%d exit=%d elapsed=%s status=done", id, time.Now().UTC().Format(time.RFC3339Nano), job.ID, job.Path, job.Retries, cfg.MaxRetries, exitCode, elapsed)
@@ -472,29 +566,22 @@ func isBusyError(err error) bool {
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy")
 }
 
-func claimNextPending(ctx context.Context, db *sql.DB, maxRetries int) (*BinJob, error) {
+func claimPendingBin(ctx context.Context, store *BinStore, maxRetries int) (*BinJob, bool, error) {
 	const maxAttempts = 8
 	backoff := 200 * time.Millisecond
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		tx, err := db.BeginTx(ctx, &sql.TxOptions{})
+		tx, err := store.db.BeginTx(ctx, &sql.TxOptions{})
 		if err != nil {
 			if isBusyError(err) {
 				time.Sleep(backoff)
 				backoff *= 2
 				continue
 			}
-			return nil, err
+			return nil, false, err
 		}
 
-		row := tx.QueryRow(`
-SELECT id, path, retries
-FROM bins
-WHERE status = 'pending'
-  AND retries < ?
-ORDER BY id
-LIMIT 1;
-`, maxRetries)
+		row := tx.StmtContext(ctx, store.stmtSelectPending).QueryRowContext(ctx, maxRetries)
 
 		var id int64
 		var path string
@@ -502,7 +589,7 @@ LIMIT 1;
 		err = row.Scan(&id, &path, &retries)
 		if err == sql.ErrNoRows {
 			_ = tx.Rollback()
-			return nil, nil
+			return nil, false, nil
 		}
 		if err != nil {
 			_ = tx.Rollback()
@@ -511,18 +598,10 @@ LIMIT 1;
 				backoff *= 2
 				continue
 			}
-			return nil, err
+			return nil, false, err
 		}
 
-		res, err := tx.Exec(`
-UPDATE bins
-SET status = 'running',
-    retries = retries + 1,
-    updated_at = ?
-WHERE id = ?
-  AND status = 'pending'
-  AND retries = ?;
-`, nowStr(), id, retries)
+		res, err := tx.StmtContext(ctx, store.stmtClaimPending).ExecContext(ctx, nowStr(), id, retries)
 		if err != nil {
 			_ = tx.Rollback()
 			if isBusyError(err) {
@@ -530,7 +609,7 @@ WHERE id = ?
 				backoff *= 2
 				continue
 			}
-			return nil, err
+			return nil, false, err
 		}
 
 		affected, _ := res.RowsAffected()
@@ -547,29 +626,23 @@ WHERE id = ?
 				backoff *= 2
 				continue
 			}
-			return nil, err
+			return nil, false, err
 		}
 
-		return &BinJob{ID: id, Path: path, Retries: retries + 1}, nil
+		return &BinJob{ID: id, Path: path, Retries: retries + 1}, true, nil
 	}
 
-	return nil, fmt.Errorf("não consegui claim pendente depois de %d tentativas", maxAttempts)
+	return nil, false, fmt.Errorf("não consegui claim pendente depois de %d tentativas", maxAttempts)
 }
 
-func updateBinSuccess(db *sql.DB, id int64) error {
-	_, err := execWithRetry(db, `
-UPDATE bins
-SET status = 'done',
-    has_json = 1,
-    last_result = 'ok',
-    last_error = NULL,
-    updated_at = ?
-WHERE id = ?;
-`, nowStr(), id)
-	return err
+func updateBinSuccess(ctx context.Context, store *BinStore, id int64) error {
+	return runUpdateTx(ctx, store, func(tx *sql.Tx) error {
+		_, err := tx.StmtContext(ctx, store.stmtUpdateSuccess).ExecContext(ctx, nowStr(), id)
+		return err
+	})
 }
 
-func updateBinError(db *sql.DB, id int64, hasJSON bool, cause error, retryPending bool, hitLimit bool) error {
+func updateBinError(ctx context.Context, store *BinStore, id int64, hasJSON bool, cause error, retryPending bool, hitLimit bool) error {
 	h := 0
 	if hasJSON {
 		h = 1
@@ -587,16 +660,50 @@ func updateBinError(db *sql.DB, id int64, hasJSON bool, cause error, retryPendin
 		result = "retry_limit"
 	}
 
-	_, err := execWithRetry(db, `
-UPDATE bins
-SET status = ?,
-    has_json = ?,
-    last_result = ?,
-    last_error = ?,
-    updated_at = ?
-WHERE id = ?;
-`, status, h, result, msg, nowStr(), id)
-	return err
+	return runUpdateTx(ctx, store, func(tx *sql.Tx) error {
+		_, err := tx.StmtContext(ctx, store.stmtUpdateError).ExecContext(ctx, status, h, result, msg, nowStr(), id)
+		return err
+	})
+}
+
+func runUpdateTx(ctx context.Context, store *BinStore, fn func(tx *sql.Tx) error) error {
+	const maxAttempts = 8
+	backoff := 200 * time.Millisecond
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		tx, err := store.db.BeginTx(ctx, &sql.TxOptions{})
+		if err != nil {
+			if isBusyError(err) {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return err
+		}
+
+		if err := fn(tx); err != nil {
+			_ = tx.Rollback()
+			if isBusyError(err) {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return err
+		}
+
+		if err := tx.Commit(); err != nil {
+			if isBusyError(err) {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return err
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("update transaction retry limit exceeded")
 }
 
 // ==== GHIDRA CALL ====
@@ -721,13 +828,13 @@ func streamCmdOutput(wg *sync.WaitGroup, r io.Reader, sink func(string)) {
 	}
 }
 
-// execWithRetry repete execuções em caso de "database is locked/busy" para maior robustez com SQLite.
-func execWithRetry(db *sql.DB, query string, args ...any) (sql.Result, error) {
+// execStmtWithRetry repete execuções em caso de "database is locked/busy" para maior robustez com SQLite.
+func execStmtWithRetry(stmt *sql.Stmt, args ...any) (sql.Result, error) {
 	const maxAttempts = 8
 	backoff := 200 * time.Millisecond
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		res, err := db.Exec(query, args...)
+		res, err := stmt.Exec(args...)
 		if err == nil {
 			return res, nil
 		}
@@ -739,5 +846,5 @@ func execWithRetry(db *sql.DB, query string, args ...any) (sql.Result, error) {
 		backoff *= 2
 	}
 
-	return nil, fmt.Errorf("exec retry limit exceeded for query: %s", strings.SplitN(strings.TrimSpace(query), "\n", 2)[0])
+	return nil, fmt.Errorf("exec retry limit exceeded for prepared statement")
 }
