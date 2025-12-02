@@ -204,7 +204,7 @@ func nowStr() string {
 }
 
 func resetRunningToPending(db *sql.DB) error {
-	_, err := db.Exec(`
+	_, err := execWithRetry(db, `
 UPDATE bins
 SET status = 'pending',
     last_result = 'interrupted',
@@ -219,7 +219,7 @@ WHERE status = 'running';
 
 // resetRetryableErrors recoloca em pending erros anteriores que ainda não atingiram o limite de tentativas.
 func resetRetryableErrors(db *sql.DB, maxRetries int) error {
-	_, err := db.Exec(`
+	_, err := execWithRetry(db, `
 UPDATE bins
 SET status = 'pending',
     last_result = 'retry_pending',
@@ -282,7 +282,7 @@ func upsertBinFromPath(db *sql.DB, cfg *Config, path string) error {
 
 	// se extensão não é suportada → SKIPPED
 	if !allowedExt[ext] {
-		_, err := db.Exec(`
+		_, err := execWithRetry(db, `
 INSERT INTO bins (path, status, has_json, last_result, last_error, retries, updated_at)
 VALUES (?, 'skipped', 0, 'unsupported_ext', NULL, 0, ?)
 ON CONFLICT(path) DO UPDATE SET
@@ -313,7 +313,7 @@ ON CONFLICT(path) DO UPDATE SET
 	// Se já existe row, isto força o estado a bater certo com o disco:
 	// - se JSON existe → done
 	// - se JSON não existe → pending
-	_, err := db.Exec(`
+	_, err := execWithRetry(db, `
 INSERT INTO bins (path, status, has_json, last_result, last_error, retries, updated_at)
 VALUES (?, ?, ?, ?, NULL, 0, ?)
 ON CONFLICT(path) DO UPDATE SET
@@ -494,7 +494,7 @@ WHERE id = ?
 }
 
 func updateBinSuccess(db *sql.DB, id int64) error {
-	_, err := db.Exec(`
+	_, err := execWithRetry(db, `
 UPDATE bins
 SET status = 'done',
     has_json = 1,
@@ -524,7 +524,7 @@ func updateBinError(db *sql.DB, id int64, hasJSON bool, cause error, retryPendin
 		result = "retry_limit"
 	}
 
-	_, err := db.Exec(`
+	_, err := execWithRetry(db, `
 UPDATE bins
 SET status = ?,
     has_json = ?,
@@ -553,13 +553,32 @@ func runGhidraForBin(ctx context.Context, cfg *Config, binPath string, workerID 
 	log.Printf("[worker %d] CMD %q args=%q", workerID, cfg.GhidraExe, args)
 
 	cmd := exec.CommandContext(ctx, cfg.GhidraExe, args...)
-	out, err := cmd.CombinedOutput()
 
-	if len(out) > 0 {
-		log.Printf("[worker %d] Ghidra output (%s):\n%s", workerID, binName, string(out))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("pipe stdout: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("pipe stderr: %w", err)
 	}
 
-	if err != nil {
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start ghidra: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go streamCmdOutput(&wg, stdout, func(line string) {
+		log.Printf("[worker %d] Ghidra stdout (%s): %s", workerID, binName, line)
+	})
+	go streamCmdOutput(&wg, stderr, func(line string) {
+		log.Printf("[worker %d] Ghidra stderr (%s): %s", workerID, binName, line)
+	})
+
+	wg.Wait()
+
+	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("Ghidra exit code %d: %w", exitErr.ExitCode(), err)
 		}
@@ -567,4 +586,44 @@ func runGhidraForBin(ctx context.Context, cfg *Config, binPath string, workerID 
 	}
 
 	return nil
+}
+
+// streamCmdOutput lê de r sem limite de tamanho de linha e envia cada linha para sink.
+func streamCmdOutput(wg *sync.WaitGroup, r io.Reader, sink func(string)) {
+	defer wg.Done()
+
+	reader := bufio.NewReader(r)
+	for {
+		chunk, err := reader.ReadString('\n')
+		if len(chunk) > 0 {
+			sink(strings.TrimRight(chunk, "\r\n"))
+		}
+		if err != nil {
+			if err != io.EOF {
+				sink(fmt.Sprintf("[stream error: %v]", err))
+			}
+			return
+		}
+	}
+}
+
+// execWithRetry repete execuções em caso de "database is locked/busy" para maior robustez com SQLite.
+func execWithRetry(db *sql.DB, query string, args ...any) (sql.Result, error) {
+	const maxAttempts = 8
+	backoff := 200 * time.Millisecond
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		res, err := db.Exec(query, args...)
+		if err == nil {
+			return res, nil
+		}
+		if !isBusyError(err) {
+			return nil, err
+		}
+
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+
+	return nil, fmt.Errorf("exec retry limit exceeded for query: %s", strings.SplitN(strings.TrimSpace(query), "\n", 2)[0])
 }
