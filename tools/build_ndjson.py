@@ -3,7 +3,8 @@ import argparse
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--only-path",
         help="Restrict processing to export files under the given subdirectory",
+    )
+    parser.add_argument(
+        "--state-db",
+        default="build_ndjson_state.sqlite",
+        help="Path to SQLite state database (default: build_ndjson_state.sqlite)",
+    )
+    parser.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="Retry files previously marked with status=error",
     )
     return parser.parse_args()
 
@@ -301,9 +312,9 @@ def load_json(path: Path) -> Optional[Dict[str, Any]]:
     return None
 
 
-def write_ndjson(docs: Iterable[OrderedDict], dest: Path) -> None:
+def write_ndjson(docs: Iterable[OrderedDict], dest: Path, mode: str = "a") -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with dest.open("w", encoding="utf-8") as f:
+    with dest.open(mode, encoding="utf-8") as f:
         for doc in docs:
             json.dump(doc, f, ensure_ascii=False, sort_keys=False)
             f.write("\n")
@@ -314,17 +325,52 @@ def iter_exports_with_loader(
 ) -> Iterable[Tuple[Path, Optional[Dict[str, Any]]]]:
     if threads > 0:
         with ThreadPoolExecutor(max_workers=threads) as executor:
-            future_map = {executor.submit(load_json, p): p for p in export_paths}
-            for future in as_completed(future_map):
-                path = future_map[future]
-                try:
-                    yield path, future.result()
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.error("Unexpected error loading %s: %s", path, exc)
-                    yield path, None
+            for path, result in zip(export_paths, executor.map(load_json, export_paths)):
+                yield path, result
     else:
         for path in export_paths:
             yield path, load_json(path)
+
+
+def normalize_export(path: Path, data: Optional[Dict[str, Any]], only_binary: Optional[str]) -> List[OrderedDict]:
+    if data is None:
+        raise ValueError("Missing data")
+
+    binary = data.get("binary") or {}
+    if not isinstance(binary, dict):
+        logger.warning("Binary metadata malformed in %s", path)
+        binary = {}
+    if only_binary and binary.get("name") != only_binary:
+        return []
+
+    sections = data.get("sections") or []
+    imports = data.get("imports") or []
+    strings = data.get("strings") or []
+
+    if not isinstance(sections, list):
+        logger.warning("Sections array malformed in %s", path)
+        sections = []
+    if not isinstance(imports, list):
+        logger.warning("Imports array malformed in %s", path)
+        imports = []
+    if not isinstance(strings, list):
+        logger.warning("Strings array malformed in %s", path)
+        strings = []
+    functions = data.get("functions") or []
+
+    if not isinstance(functions, list):
+        logger.warning("Functions array malformed in %s", path)
+        functions = []
+
+    documents: List[OrderedDict] = []
+    for func in functions:
+        if not isinstance(func, dict):
+            logger.warning("Skipping non-dict function entry in %s", path)
+            continue
+        documents.append(
+            normalize_function_doc(binary, sections, imports, strings, func)
+        )
+    return documents
 
 
 def build_documents(
@@ -341,46 +387,77 @@ def build_documents(
     wrapped_iter = tqdm(iterator, total=total, disable=not use_tqdm) if total else iterator
 
     for idx, (path, data) in enumerate(wrapped_iter, start=1):
-        if data is None:
-            continue
-        binary = data.get("binary") or {}
-        if not isinstance(binary, dict):
-            logger.warning("Binary metadata malformed in %s", path)
-            binary = {}
-        if only_binary and binary.get("name") != only_binary:
-            continue
-
-        sections = data.get("sections") or []
-        imports = data.get("imports") or []
-        strings = data.get("strings") or []
-
-        if not isinstance(sections, list):
-            logger.warning("Sections array malformed in %s", path)
-            sections = []
-        if not isinstance(imports, list):
-            logger.warning("Imports array malformed in %s", path)
-            imports = []
-        if not isinstance(strings, list):
-            logger.warning("Strings array malformed in %s", path)
-            strings = []
-        functions = data.get("functions") or []
-
-        if not isinstance(functions, list):
-            logger.warning("Functions array malformed in %s", path)
-            functions = []
-
-        for func in functions:
-            if not isinstance(func, dict):
-                logger.warning("Skipping non-dict function entry in %s", path)
-                continue
-            documents.append(
-                normalize_function_doc(binary, sections, imports, strings, func)
-            )
+        try:
+            documents.extend(normalize_export(path, data, only_binary))
+        except Exception:
+            logger.exception("Failed to normalize %s", path)
 
         if not use_tqdm and idx % max(log_every, 1) == 0:
             logger.info("Processed %d/%d files", idx, total)
 
     return documents
+
+
+def init_state_db(state_db: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(state_db)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+            path TEXT PRIMARY KEY,
+            mtime INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            last_error TEXT
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def sync_state_db(conn: sqlite3.Connection, export_files: Sequence[Path]) -> None:
+    for path in export_files:
+        abs_path = str(path.resolve())
+        try:
+            mtime = int(path.stat().st_mtime)
+        except OSError as exc:
+            logger.error("Cannot stat %s: %s", path, exc)
+            continue
+        cur = conn.execute("SELECT mtime FROM files WHERE path=?", (abs_path,))
+        row = cur.fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO files(path, mtime, status, last_error) VALUES (?, ?, 'pending', NULL)",
+                (abs_path, mtime),
+            )
+        elif row[0] != mtime:
+            conn.execute(
+                "UPDATE files SET mtime=?, status='pending', last_error=NULL WHERE path=?",
+                (mtime, abs_path),
+            )
+    conn.commit()
+
+
+def reset_error_rows(conn: sqlite3.Connection) -> None:
+    conn.execute("UPDATE files SET status='pending', last_error=NULL WHERE status='error'")
+    conn.commit()
+
+
+def fetch_status_counts(conn: sqlite3.Connection) -> Dict[str, int]:
+    counts = {"pending": 0, "done": 0, "error": 0}
+    for status, count in conn.execute("SELECT status, COUNT(*) FROM files GROUP BY status"):
+        counts[status] = count
+    return counts
+
+
+def fetch_pending_paths(conn: sqlite3.Connection) -> List[Path]:
+    return [Path(row[0]) for row in conn.execute("SELECT path FROM files WHERE status='pending' ORDER BY path")]
+
+
+def update_status(conn: sqlite3.Connection, path: Path, status: str, error: Optional[str] = None) -> None:
+    conn.execute(
+        "UPDATE files SET status=?, last_error=? WHERE path=?",
+        (status, error, str(path.resolve())),
+    )
 
 
 def main() -> None:
@@ -399,15 +476,85 @@ def main() -> None:
 
     if args.progress and not TQDM_AVAILABLE:
         logger.warning("tqdm not installed; progress bar disabled")
+    state_db_path = Path(args.state_db)
+    state_db_existed = state_db_path.exists()
+    conn = init_state_db(state_db_path)
 
-    documents = build_documents(
-        export_files,
-        args.only_binary,
-        max(args.threads, 0),
-        args.progress,
-        max(args.log_every, 1),
-    )
-    write_ndjson(documents, Path(args.output))
+    try:
+        sync_state_db(conn, export_files)
+        if args.retry_errors:
+            reset_error_rows(conn)
+
+        counts = fetch_status_counts(conn)
+        logger.info(
+            "Startup state - pending: %d, done: %d, error: %d",
+            counts.get("pending", 0),
+            counts.get("done", 0),
+            counts.get("error", 0),
+        )
+
+        pending_paths = fetch_pending_paths(conn)
+        if not pending_paths:
+            logger.info("No pending files to process")
+            return
+
+        output_path = Path(args.output)
+        output_mode = "a" if state_db_existed or output_path.exists() or counts.get("done", 0) else "w"
+        log_every = max(args.log_every, 1)
+        total_files = sum(counts.values()) or len(pending_paths)
+        errors_seen = 0
+        processed = 0
+
+        iterator = iter_exports_with_loader(
+            pending_paths,
+            max(args.threads, 0),
+        )
+        use_tqdm = args.progress and TQDM_AVAILABLE
+        wrapped_iter = tqdm(iterator, total=len(pending_paths), disable=not use_tqdm) if pending_paths else iterator
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open(output_mode, encoding="utf-8") as out_file:
+            try:
+                for idx, (path, data) in enumerate(wrapped_iter, start=1):
+                    try:
+                        documents = normalize_export(path, data, args.only_binary)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        msg = str(exc)
+                        logger.error("Failed to process %s: %s", path, msg)
+                        update_status(conn, path, "error", msg[:512])
+                        conn.commit()
+                        errors_seen += 1
+                    else:
+                        for doc in documents:
+                            json.dump(doc, out_file, ensure_ascii=False, sort_keys=False)
+                            out_file.write("\n")
+                        out_file.flush()
+                        update_status(conn, path, "done", None)
+                        conn.commit()
+                        processed += 1
+
+                    if not use_tqdm and idx % log_every == 0:
+                        logger.info(
+                            "Processed %d/%d, errors: %d",
+                            counts.get("done", 0) + processed,
+                            total_files,
+                            counts.get("error", 0) + errors_seen,
+                        )
+            except KeyboardInterrupt:
+                logger.info("Interrupted by user, flushing state...")
+                out_file.flush()
+                conn.commit()
+                raise
+
+        final_counts = fetch_status_counts(conn)
+        logger.info(
+            "Completed - pending: %d, done: %d, error: %d",
+            final_counts.get("pending", 0),
+            final_counts.get("done", 0),
+            final_counts.get("error", 0),
+        )
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
