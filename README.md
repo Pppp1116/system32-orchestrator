@@ -54,6 +54,13 @@ The orchestrator is designed to be restarted safely; completed jobs are not repr
 - **Go**: `go build -o orchestrator.exe orchestrator.go`
 - **Rust** (optional utility): `cargo build --release`
 
+## Building NDJSON exports
+Use the Python helper to consolidate all `export.v5.json` files into a single NDJSON:
+
+```
+python tools/build_ndjson.py --input C:\ghidra_exports --output system32_v5.ndjson
+```
+
 ## Ghidra export script
 `export_full_json.py` keeps the existing JSON schema intact. It accepts the output root and optional flags (include decompiled code, asm, strings, xrefs, CFG) but all defaults preserve the current output. The orchestrator always invokes it with the output root only.
 
